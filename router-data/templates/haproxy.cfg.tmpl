@@ -1,0 +1,111 @@
+{{ $CurrentContainer := where $ "Name" "pdfc-router" | first }}
+{{ $globalHost := .Docker.CurrentContainerID }}
+
+global
+    log                         /dev/log local0
+    maxconn                     2000
+    pidfile                     /var/run/haproxy.pid
+    daemon
+
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option                  redispatch
+    retries                 3
+    timeout connect         5000s
+    timeout client          1200000s
+    timeout server          1200000s
+
+    # This balance algorithm will make sure the client sticks to the given server node
+    balance                 hdr(Cookie)
+
+    option                  forwardfor # X-Real-IP & X-Forwared-For
+    option                  http-server-close
+
+# Optional HAProxy Statistics
+listen stats
+   bind *:1936
+   stats enable
+   stats hide-version
+   stats realm HAProxy\ Statistics
+   stats uri /
+   stats auth pdfc:statistics
+
+frontend http-in
+    mode http
+    bind *:80
+
+    option httplog
+    option forwardfor
+    option http-server-close
+    option httpclose
+
+    # see https://cipherli.st
+    http-response set-header X-Frame-Options SAMEORIGIN
+    http-response set-header X-Content-Type-Options nosniff
+    http-response set-header X-XSS-Protection "1; mode=block"
+    http-response set-header Strict-Transport-Security "max-age=15768000; preload"
+
+    # Find the host port that is bound to the proxies ports
+    {{ range $address := $CurrentContainer.Addresses }}
+        # Port: {{$address.Port }} {{ $address.HostPort }}
+        {{ if eq "80" $address.Port }}
+
+    http-request set-header X-Forwarded-Port "{{ $address.HostPort }}"
+
+        {{ end }}
+    {{ end }}
+
+    # Only for HttpOnly
+    http-response replace-header Set-Cookie ^((?!HttpOnly).)*$ \1;HttpOnly
+    # always add secure to cookie
+    http-response replace-header Set-Cookie (.*) \1;Secure
+
+    acl is_robot path /robots.txt
+    use_backend robotstxt if is_robot
+    
+    # Forward to PDFC backend
+    use_backend pdfc_backend
+
+backend robotstxt
+    mode http
+    errorfile 503 /etc/docker-gen/templates/200robots.http
+
+#
+################################################################
+backend pdfc_backend
+#
+    {{ range $marker, $containers := groupByMulti $ "Env.PDFC_HAPROXY_MARKER" "," }}
+    # Host for: {{ $marker }} and containers: {{ ( $containers | first).ID }}
+
+        {{ $container := ( $containers | first) }}
+        {{ $referrer_policy := coalesce $container.Env.REFERRER_POLICY "no-referrer-when-downgrade" }}
+
+    http-response set-header Referrer-Policy {{ $referrer_policy }}
+
+# ______________________________________________________________
+        {{ range $container := $containers }}
+        # Container list entry for: {{ $container.ID }}
+            
+            {{ $port := coalesce $container.Env.CONF_listener__port "80" }}
+
+            {{ range $globalNetwork := $CurrentContainer.Networks }}
+
+                {{ range $network := $container.Networks }}
+                # Check Network Name: {{ $globalNetwork.Name }}  > {{ $network.Name }}
+                
+                    {{ if eq $globalNetwork.Name $network.Name }}
+
+                        {{ $servername := sha1 ( json ( dict $container.ID $network.IP ) ) }}
+
+    server {{ $servername }} {{ $network.IP }}:{{ $port }}
+
+                    {{ end }}
+                {{ end }}
+            {{ end }}
+        {{ end }}
+    {{ end }}
+
+# --------------------------------------------------------------

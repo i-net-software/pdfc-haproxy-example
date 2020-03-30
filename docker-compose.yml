@@ -1,0 +1,93 @@
+version: '2.1'
+
+services:
+    pdfc:
+        image: inetsoftware/i-net-pdfc-server:latest
+        entrypoint:
+            # Override start entry to wait for the mongo database connection
+            - sh
+            - wait-for.sh
+            - mongo:27017
+            - --
+            - sh
+            - ./startServer.sh
+            - -Dclearreports.config=System/Default
+            - -Dsetupautoexecution=true
+        environment:
+            # Link to the persistence
+            inet_persistence: mongodb://root:pdfcExample@mongo/pdfc
+            # Default Config HAS TO BE System/Default
+            DEFAULT_CONFIG: System/Default
+            # Do not overwrite existing properties or else a restart would trash all settings
+            FORCE_IMPORT_CONFIG: 0
+
+            # PDFC Config ... add more options here
+            #CONF_licensekey: 
+            CONF_listener__port: 80
+
+            # DO NOT MODIFY THIS IS A MARKER FOR THE HAPROXY
+            PDFC_HAPROXY_MARKER: PDFC-Server
+        links:
+            - mongo:mongo
+        networks:
+            pdfc:
+            router:
+
+    mongo:
+        image: mongo
+        restart: always
+        environment:
+            MONGO_INITDB_ROOT_USERNAME: root
+            MONGO_INITDB_ROOT_PASSWORD: pdfcExample
+            constraint: node.type==master 
+        networks:
+            pdfc:
+
+    # Build the Data Image from the current folder
+    # It contains
+    router:
+        image: "haproxy:alpine"
+        container_name: "pdfc-router"
+        restart: "always"
+        environment:
+            constraint: node.type==master 
+        volumes_from:
+            - dockergen
+        volumes:
+            - ${SSL_CERTIFICATE_BUNDLE}/etc/ssl/ssl-certificate.pem:ro
+            - /dev/log:/dev/log
+        ports:
+            - "${ROUTER_PORT_80}80"
+            - "${ROUTER_PORT_443}443"
+
+            # 1936 is the default statistics port. They are disabled for now.
+            - "${ROUTER_PORT_1936}1936"
+
+        networks:
+            - router
+
+    # Generator for the nginx template file
+    dockergen:
+        build: "router-data"
+        container_name: "pdfc-router-data"
+        command: "-notify-sighup pdfc-router ${DOCKERGEN_TLS_SETUP} -watch ${INTERVAL} -only-exposed /etc/docker-gen/templates/${HAPROXY_TEMPLATE} /usr/local/etc/haproxy/haproxy.cfg"
+        restart: "always"
+        environment:
+            DOCKER_HOST: ${DOCKER_MASTER_NODE}
+            constraint: node.type==master
+        volumes:
+            # we need the swarm endpoint or we will not receive all events
+            - ${DOCKER_DAEMON_SOCKET}/var/run/docker.sock:ro
+
+            # Use the certificate section if required
+            - ${DOCKER_TLS_CA}/certs/ca.pem:ro
+            - ${DOCKER_TLS_CERTIFICATE}/certs/cert.pem:ro
+            - ${DOCKER_TLS_CERTIFICATE_KEY}/certs/key.pem:ro
+            - /usr/local/etc/haproxy/
+
+networks:
+    pdfc:
+        driver: overlay
+    router:
+        driver: overlay
+        name: pdfc-router
